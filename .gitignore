@@ -1,6 +1,20 @@
-.venv/
-__pycache__/
-*.pyc
-.vscode/
+# 環境變數與秘密金鑰（絕對不能推上 GitHub）
 .env
+
+# 語音音樂儲存資料夾（避免大檔案塞爆 Git 倉庫）
 songs/
+
+# Python 編譯快取與暫存檔
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虛擬環境資料夾
+venv/
+.venv/
+env/
+
+# 系統與編輯器暫存檔
+.DS_Store
+.vscode/
+.idea/
