@@ -4,10 +4,19 @@ import requests
 import pandas as pd
 import datetime
 import os
+import asyncio
+import json
 # 💡 導入 FinMind 官方套件
 from FinMind.data import DataLoader
+from dotenv import load_dotenv
 
-OLLAMA_API = "http://localhost:11434/api/generate"
+load_dotenv()
+
+# 💡 從環境變數讀取通用 AI 設定（與 chat.py 完全共用）
+AI_API_URL = os.getenv("AI_API_URL")
+AI_API_KEY = os.getenv("AI_API_KEY", "any_string")
+AI_MODEL = os.getenv("AI_MODEL")
+
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "")
 
 class Daily(commands.Cog, description="綜合籌碼與技術面分析指令"):
@@ -49,6 +58,40 @@ class Daily(commands.Cog, description="綜合籌碼與技術面分析指令"):
         latest_data['BB_lower'] = float(latest_data['BB_middle'] - (2 * std20.iloc[-1]))
         
         return latest_data
+
+    # 💡 核心優化：建立執行緒安全、全標準 OpenAI 規格的發送端，完美兼顧本地與雲端
+    async def _get_ai_response(self, messages):
+        def sync_post():
+            try:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {AI_API_KEY}"
+                }
+                payload = {
+                    "model": AI_MODEL,
+                    "messages": messages,
+                    "temperature": 0.7
+                }
+                
+                # 財經分析 Prompt 通常較長，將 timeout 放寬至 60 秒
+                response = requests.post(AI_API_URL, json=payload, headers=headers, timeout=60)
+                res_json = response.json()
+
+                if response.status_code == 200:
+                    # 💡 精確提取標準 OpenAI 格式的第 0 個 choices 元素，不再拋出 TypeError
+                    if 'choices' in res_json and len(res_json['choices']) > 0:
+                        return res_json['choices'][0]['message']['content'].strip()
+                    else:
+                        print(f"❌ [Daily] API 成功但格式不符: {res_json}")
+                        return ""
+                else:
+                    print(f"❌ [Daily] AI API 錯誤代碼 {response.status_code}: {response.text}")
+                    return ""
+            except Exception as e:
+                print(f"❌ [Daily] 網路連線或解析超時崩潰: {e}")
+                return ""
+                
+        return await asyncio.to_thread(sync_post)
 
     @commands.command(name="daily", help="綜合籌碼與技術面分析。用法: !daily <股票代號>")
     async def daily(self, ctx, stock_id: str = "2330"):
@@ -118,8 +161,8 @@ class Daily(commands.Cog, description="綜合籌碼與技術面分析指令"):
                         f" 🔹 融券賣出: {latest_margin['ShortSaleBuy']:,} 股 / 餘額: {latest_margin['ShortSaleLimit']:,} 股"
                     )
 
-                # 5. 構建升級後的 AI Prompt
-                prompt = (
+                # 5. 構建大腦分析 Prompt
+                prompt_content = (
                     f"你是一位精通台灣股市的專業量化分析師，請針對以下最新技術面與【外資多空均線交叉】進行『實戰解讀』。\n"
                     f"規則：\n"
                     f"1. 必須完全使用『台灣繁體中文』回答。\n"
@@ -140,30 +183,19 @@ class Daily(commands.Cog, description="綜合籌碼與技術面分析指令"):
                     f"{margin_summary}"
                 )
 
-                # 6. 呼叫 Ollama 模型
-                response = requests.post(
-                    OLLAMA_API,
-                    json={
-                        "model": os.getenv("OLLAMA_MODEL"),
-                        "prompt": prompt,
-                        "stream": False
-                    },
-                    timeout=180
-                )
+                # 💡 6. 封裝成 Gemini / Ollama 兩邊都百分百通用的單一 user 訊息（不含 system role 阻礙）
+                messages = [{"role": "user", "content": prompt_content}]
                 
-                if response.status_code == 200:
-                    model_reply = response.json().get("response", "")
-                else:
-                    await ctx.send(f"⚠️ AI 伺服器回傳錯誤代碼: {response.status_code}")
-                    return
+                # 呼叫相容格式的 AI 函式
+                model_reply = await self._get_ai_response(messages)
 
             # 7. 輸出（分段發送防止爆字數）
-            if model_reply.strip():
+            if model_reply and model_reply.strip():
                 full_msg = f"🧑‍💻 **個股 {stock_id_clean} 官方套件實戰籌碼均線 X 技術面綜合解讀**：\n{model_reply}"
                 for i in range(0, len(full_msg), 1900):
                     await ctx.send(full_msg[i:i+1900])
             else:
-                await ctx.send("⚠️ 模型未回傳分析結果。")
+                await ctx.send("⚠️ 呱... 籌碼分析大腦恍神了，沒能回傳分析結果。可以檢查一下控制台日誌。")
 
         except Exception as e:
             await ctx.send(f"❌ 綜合分析失敗：{e}")

@@ -4,24 +4,27 @@ import requests
 import json
 import asyncio
 import os
-import sqlite3  # 💡 引入內建的 SQLite 套件
+import sqlite3
 from datetime import datetime
+from dotenv import load_dotenv
 
-OLLAMA_API = "http://localhost:11434/api/generate"
-DB_PATH = "frog_memory.db"  # 資料庫檔案路徑
+load_dotenv()
 
-# 💡 初始化資料庫與建立資料表
+AI_API_URL = os.getenv("AI_API_URL")
+AI_API_KEY = os.getenv("AI_API_KEY", "any_string")
+AI_MODEL = os.getenv("AI_MODEL")
+
+DB_PATH = "frog_memory.db"
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # 1. 儲存長期記憶摘要的資料表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS frog_summary (
             user_id INTEGER PRIMARY KEY,
             summary TEXT DEFAULT '我們剛剛開始認識。'
         )
     ''')
-    # 2. 儲存近期對話細節的資料表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS frog_recent_chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,31 +37,64 @@ def init_db():
     conn.commit()
     conn.close()
 
-# 啟動時自動初始化資料庫
 init_db()
 
-class Chat(commands.Cog, description="具備 SQLite 摘要記憶功能的青蛙聊天"):
+class Chat(commands.Cog, description="具備高度偵錯功能的通用聊天模組"):
     def __init__(self, bot):
         self.bot = bot
 
-    # 💡 核心優化：保留 requests，但用 to_thread 丟到背景執行緒，徹底防止機器人斷線（Heartbeat Blocked）
-    async def _get_ai_response(self, prompt, timeout=120):
+    async def _get_ai_response(self, messages):
         def sync_post():
+            print("\n=== ⚙️ AI API 偵錯起點 ===")
+            print(f"📡 目標網址: '{AI_API_URL}'")
+            print(f"🏷️ 請求型號: '{AI_MODEL}'")
+            print(f"🔑 金鑰前五碼: '{AI_API_KEY[:5] if AI_API_KEY else 'None'}... (總長: {len(AI_API_KEY) if AI_API_KEY else 0})'")
+            
             try:
-                response = requests.post(
-                    OLLAMA_API,
-                    json={"model": os.getenv("OLLAMA_MODEL"), "prompt": prompt, "stream": False},
-                    timeout=timeout
-                )
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {AI_API_KEY}"
+                }
+                payload = {
+                    "model": AI_MODEL,
+                    "messages": messages,
+                    "temperature": 0.7
+                }
+                
+                print(f"📦 準備送出的 Payload 結構:\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+                print("⏳ 正在發送網路請求 (Timeout 設定為 30 秒)...")
+                
+                response = requests.post(AI_API_URL, json=payload, headers=headers, timeout=30)
+                
+                print(f"📥 收到回應！HTTP 狀態碼: {response.status_code}")
+                
+                try:
+                    res_json = response.json()
+                    print(f"📄 原始 JSON 回覆:\n{json.dumps(res_json, ensure_ascii=False, indent=2)}")
+                except Exception as json_e:
+                    print(f"❌ 無法解析回傳的文字為 JSON. 原始回傳純文字為:\n{response.text}")
+                    return ""
+
                 if response.status_code == 200:
-                    return response.json().get("response", "").strip()
+                    if 'choices' in res_json:
+                        return res_json['choices'][0]['message']['content'].strip()
+                    else:
+                        print("❌ 警告: 狀態碼 200 但格式不符合 OpenAI 規範 (找不到 'choices')")
+                        return ""
+                else:
+                    print(f"❌ 伺服器拒絕請求，錯誤資訊: {response.text}")
+                    return ""
+            except requests.exceptions.Timeout:
+                print("❌ 錯誤: 網路連線完全超時 (Timeout)，伺服器毫無回應！")
                 return ""
             except Exception as e:
-                print(f"Ollama 連線錯誤: {e}")
+                print(f"❌ 網路連線期間發生未預期的崩潰: {type(e).__name__} - {e}")
                 return ""
+            finally:
+                print("=== 🔚 AI API 偵錯終點 ===\n")
+                
         return await asyncio.to_thread(sync_post)
 
-    # 💡 DB 操作：獲取或初始化長期記憶摘要
     async def _db_get_summary(self, user_id):
         def fetch():
             conn = sqlite3.connect(DB_PATH)
@@ -70,12 +106,11 @@ class Chat(commands.Cog, description="具備 SQLite 摘要記憶功能的青蛙�
                 conn.commit()
                 summary = "我們剛剛開始認識。"
             else:
-                summary = row[0]
+                summary = str(row[0])
             conn.close()
             return summary
         return await asyncio.to_thread(fetch)
 
-    # 💡 DB 操作：讀取近期對話清單
     async def _db_get_recent(self, user_id):
         def fetch():
             conn = sqlite3.connect(DB_PATH)
@@ -86,7 +121,6 @@ class Chat(commands.Cog, description="具備 SQLite 摘要記憶功能的青蛙�
             return rows
         return await asyncio.to_thread(fetch)
 
-    # 💡 DB 操作：寫入一筆新對話
     async def _db_save_chat(self, user_id, role, content):
         def save():
             conn = sqlite3.connect(DB_PATH)
@@ -100,35 +134,28 @@ class Chat(commands.Cog, description="具備 SQLite 摘要記憶功能的青蛙�
             conn.close()
         await asyncio.to_thread(save)
 
-    # 💡 DB 操作：摘要完成後，更新長期記憶並清空近期對話
     async def _db_cycle_summary(self, user_id, new_summary):
         def cycle():
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
-            # 更新摘要
             cursor.execute("UPDATE frog_summary SET summary = ? WHERE user_id = ?", (new_summary, user_id))
-            # 清空近期詳細對話
             cursor.execute("DELETE FROM frog_recent_chats WHERE user_id = ?", (user_id,))
             conn.commit()
             conn.close()
         await asyncio.to_thread(cycle)
 
     async def summarize_memory(self, user_id, current_summary, recent_chats):
-        """將使用者的對話紀錄進行摘要，減輕記憶體負擔"""
         recent_text = "\n".join([f"{r}: {c}" for r, c in recent_chats])
-        
         prompt = (
             f"你是一個記憶整理助手。請將以下對話內容總結成一段 100 字內的繁體中文精華，"
-            f"保留使用者的偏好、提到的重要資訊或特殊性格。\n"
+            f"保留使用者的偏好、提到的重要資訊 or 特殊性格。\n"
             f"現有記憶：{current_summary}\n"
             f"新對話內容：\n{recent_text}\n"
             f"請輸出新的綜合記憶精華："
         )
-        
-        # 加上關鍵的 await 呼叫非同步 AI
-        new_summary = await self._get_ai_response(prompt, timeout=60)
+        messages = [{"role": "user", "content": prompt}]
+        new_summary = await self._get_ai_response(messages)
         if new_summary:
-            # 💡 改為將新摘要刷進 SQLite
             await self._db_cycle_summary(user_id, new_summary)
 
     @commands.command(help="與青蛙聊天 (具備長短期記憶)")
@@ -139,48 +166,53 @@ class Chat(commands.Cog, description="具備 SQLite 摘要記憶功能的青蛙�
 
         user_id = ctx.author.id
         
-        # 1. 從 SQLite 讀取該用戶目前的長短期記憶狀態
         current_summary = await self._db_get_summary(user_id)
         recent_chats = await self._db_get_recent(user_id)
 
-        # 2. 檢查是否需要啟動「摘要機制」 (累積 20 句時)
         if len(recent_chats) >= 20:
             await ctx.send("⌛ *青蛙正在整理腦袋裡的記憶...*")
             await self.summarize_memory(user_id, current_summary, recent_chats)
-            # 摘要更新完成後，重新從資料庫撈取最新的狀態
             current_summary = await self._db_get_summary(user_id)
             recent_chats = await self._db_get_recent(user_id)
 
-        # 3. 組合 Prompt
-        history_text = "\n".join([f"{role}: {content}" for role, content in recent_chats])
-        prompt = (
-            f"系統設定：你是一隻住在台灣、語音幽默且友善的青蛙，請用『繁體中文』回答。\n"
-            f"長期記憶：{current_summary}\n"
-            f"{history_text}\n"
-            f"使用者: {message}\n"
-            f"青蛙助理:"
-        )
+        system_instruction = "你是一隻住在台灣、語音幽默且友善的青蛙，請用『繁體中文』回答，結尾可以帶點青蛙的叫聲如『呱』。"
 
-        # 4. 呼叫 AI (顯示正在輸入中)
+        messages = []
+        is_first = True
+        for role, content in recent_chats:
+            api_role = "user" if role == "使用者" else "assistant"
+            if is_first and api_role == "user":
+                messages.append({
+                    "role": "user",
+                    "content": f"【系統任務：{system_instruction} 歷史記憶：{current_summary}】\n\n對話開始：\n{content}"
+                })
+                is_first = False
+            else:
+                messages.append({"role": api_role, "content": content})
+
+        if is_first:
+            messages.append({
+                "role": "user",
+                "content": f"【系統任務：{system_instruction} 歷史記憶：{current_summary}】\n\n使用者問：{message}"
+            })
+        else:
+            messages.append({"role": "user", "content": message})
+
         async with ctx.typing():
-            reply = await self._get_ai_response(prompt, timeout=120)
+            reply = await self._get_ai_response(messages)
 
         if reply:
-            # 5. 更新對話紀錄到 SQLite 資料庫
             await self._db_save_chat(user_id, "使用者", message)
             await self._db_save_chat(user_id, "青蛙助理", reply)
 
-            # 6. 分段發送訊息 (解決 2000 字限制)
             for i in range(0, len(reply), 1900):
                 await ctx.send(reply[i:i+1900])
         else:
-            await ctx.send("⚠️ 呱... 我好像恍神了，沒聽到你說什麼。")
+            await ctx.send("⚠️ 呱... 執行失敗，除錯日誌已列印在後台。")
 
     @commands.command(help="清除青蛙對你的所有記憶")
     async def resetchat(self, ctx):
         user_id = ctx.author.id
-        
-        # 💡 移除不必要的 if 判斷，只要下指令，就無條件對該用戶的資料進行全面清洗
         def delete_history():
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
@@ -190,7 +222,6 @@ class Chat(commands.Cog, description="具備 SQLite 摘要記憶功能的青蛙�
             conn.close()
 
         try:
-            # 丟到背景執行緒安全刪除
             await asyncio.to_thread(delete_history)
             await ctx.send("🗑️ *青蛙喝了忘情水，把你全忘光了！*")
         except Exception as e:
