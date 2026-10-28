@@ -4,7 +4,7 @@ import requests
 import json
 import asyncio
 import os
-import sqlite3
+import psycopg 
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -14,28 +14,31 @@ AI_API_URL = os.getenv("AI_API_URL")
 AI_API_KEY = os.getenv("AI_API_KEY", "any_string")
 AI_MODEL = os.getenv("AI_MODEL")
 
-DB_PATH = "frog_memory.db"
+# 2. 讀取並自動修正 Render 的 postgres:// 前綴
+DATABASE_URL = os.getenv("DB_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# 3. 初始化資料庫（如果表不存在才建立，不影響舊表）
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS frog_summary (
-            user_id INTEGER PRIMARY KEY,
-            summary TEXT DEFAULT '我們剛剛開始認識。'
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS frog_recent_chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            role TEXT,
-            content TEXT,
-            timestamp TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS frog_summary (
+                    user_id BIGINT PRIMARY KEY,
+                    summary TEXT DEFAULT '我們剛剛開始認識。'
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS frog_recent_chats (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    role TEXT,
+                    content TEXT,
+                    timestamp TIMESTAMP WITHOUT TIME ZONE
+                )
+            ''')
+            conn.commit()
 
 init_db()
 
@@ -49,7 +52,6 @@ class Chat(commands.Cog, description="具備高度偵錯功能的通用聊天模
             print(f"📡 目標網址: '{AI_API_URL}'")
             print(f"🏷️ 請求型號: '{AI_MODEL}'")
             print(f"🔑 金鑰前五碼: '{AI_API_KEY[:5] if AI_API_KEY else 'None'}... (總長: {len(AI_API_KEY) if AI_API_KEY else 0})'")
-            
             try:
                 headers = {
                     "Content-Type": "application/json",
@@ -60,21 +62,17 @@ class Chat(commands.Cog, description="具備高度偵錯功能的通用聊天模
                     "messages": messages,
                     "temperature": 0.7
                 }
-                
                 print(f"📦 準備送出的 Payload 結構:\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
                 print("⏳ 正在發送網路請求 (Timeout 設定為 30 秒)...")
-                
                 response = requests.post(AI_API_URL, json=payload, headers=headers, timeout=30)
-                
                 print(f"📥 收到回應！HTTP 狀態碼: {response.status_code}")
-                
                 try:
                     res_json = response.json()
                     print(f"📄 原始 JSON 回覆:\n{json.dumps(res_json, ensure_ascii=False, indent=2)}")
                 except Exception as json_e:
                     print(f"❌ 無法解析回傳的文字為 JSON. 原始回傳純文字為:\n{response.text}")
                     return ""
-
+                
                 if response.status_code == 200:
                     if 'choices' in res_json:
                         return res_json['choices'][0]['message']['content'].strip()
@@ -92,56 +90,52 @@ class Chat(commands.Cog, description="具備高度偵錯功能的通用聊天模
                 return ""
             finally:
                 print("=== 🔚 AI API 偵錯終點 ===\n")
-                
         return await asyncio.to_thread(sync_post)
 
     async def _db_get_summary(self, user_id):
         def fetch():
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT summary FROM frog_summary WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            if not row:
-                cursor.execute("INSERT INTO frog_summary (user_id, summary) VALUES (?, ?)", (user_id, "我們剛剛開始認識。"))
-                conn.commit()
-                summary = "我們剛剛開始認識。"
-            else:
-                summary = str(row[0])
-            conn.close()
+            # 4. 所有的問號 ? 佔位符皆更換為 %s
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT summary FROM frog_summary WHERE user_id = %s", (user_id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        cursor.execute("INSERT INTO frog_summary (user_id, summary) VALUES (%s, %s)", (user_id, "我們剛剛開始認識。"))
+                        conn.commit()
+                        summary = "我們剛剛開始認識。"
+                    else:
+                        summary = str(row[0])
             return summary
         return await asyncio.to_thread(fetch)
 
     async def _db_get_recent(self, user_id):
         def fetch():
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT role, content FROM frog_recent_chats WHERE user_id = ? ORDER BY id ASC", (user_id,))
-            rows = cursor.fetchall()
-            conn.close()
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT role, content FROM frog_recent_chats WHERE user_id = %s ORDER BY id ASC", (user_id,))
+                    rows = cursor.fetchall()
             return rows
         return await asyncio.to_thread(fetch)
 
     async def _db_save_chat(self, user_id, role, content):
         def save():
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute(
-                "INSERT INTO frog_recent_chats (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                (user_id, role, content, now)
-            )
-            conn.commit()
-            conn.close()
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cursor:
+                    now = datetime.now()
+                    cursor.execute(
+                        "INSERT INTO frog_recent_chats (user_id, role, content, timestamp) VALUES (%s, %s, %s, %s)",
+                        (user_id, role, content, now)
+                    )
+                    conn.commit()
         await asyncio.to_thread(save)
 
     async def _db_cycle_summary(self, user_id, new_summary):
         def cycle():
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE frog_summary SET summary = ? WHERE user_id = ?", (new_summary, user_id))
-            cursor.execute("DELETE FROM frog_recent_chats WHERE user_id = ?", (user_id,))
-            conn.commit()
-            conn.close()
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("UPDATE frog_summary SET summary = %s WHERE user_id = %s", (new_summary, user_id))
+                    cursor.execute("DELETE FROM frog_recent_chats WHERE user_id = %s", (user_id,))
+                    conn.commit()
         await asyncio.to_thread(cycle)
 
     async def summarize_memory(self, user_id, current_summary, recent_chats):
@@ -165,7 +159,6 @@ class Chat(commands.Cog, description="具備高度偵錯功能的通用聊天模
             return
 
         user_id = ctx.author.id
-        
         current_summary = await self._db_get_summary(user_id)
         recent_chats = await self._db_get_recent(user_id)
 
@@ -176,9 +169,9 @@ class Chat(commands.Cog, description="具備高度偵錯功能的通用聊天模
             recent_chats = await self._db_get_recent(user_id)
 
         system_instruction = "你是一隻住在台灣、語音幽默且友善的青蛙，請用『繁體中文』回答，結尾可以帶點青蛙的叫聲如『呱』。"
-
         messages = []
         is_first = True
+
         for role, content in recent_chats:
             api_role = "user" if role == "使用者" else "assistant"
             if is_first and api_role == "user":
@@ -200,27 +193,23 @@ class Chat(commands.Cog, description="具備高度偵錯功能的通用聊天模
 
         async with ctx.typing():
             reply = await self._get_ai_response(messages)
-
-        if reply:
-            await self._db_save_chat(user_id, "使用者", message)
-            await self._db_save_chat(user_id, "青蛙助理", reply)
-
-            for i in range(0, len(reply), 1900):
-                await ctx.send(reply[i:i+1900])
-        else:
-            await ctx.send("⚠️ 呱... 執行失敗，除錯日誌已列印在後台。")
+            if reply:
+                await self._db_save_chat(user_id, "使用者", message)
+                await self._db_save_chat(user_id, "青蛙助理", reply)
+                for i in range(0, len(reply), 1900):
+                    await ctx.send(reply[i:i+1900])
+            else:
+                await ctx.send("⚠️ 呱... 執行失敗，除錯日誌已列印在後台。")
 
     @commands.command(help="清除青蛙對你的所有記憶")
     async def resetchat(self, ctx):
         user_id = ctx.author.id
         def delete_history():
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM frog_summary WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM frog_recent_chats WHERE user_id = ?", (user_id,))
-            conn.commit()
-            conn.close()
-
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("DELETE FROM frog_summary WHERE user_id = %s", (user_id,))
+                    cursor.execute("DELETE FROM frog_recent_chats WHERE user_id = %s", (user_id,))
+                    conn.commit()
         try:
             await asyncio.to_thread(delete_history)
             await ctx.send("🗑️ *青蛙喝了忘情水，把你全忘光了！*")

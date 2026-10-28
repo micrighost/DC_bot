@@ -13,4 +13,4 @@ pandas
 yfinance
 fastapi
 uvicorn
-
+psycopg[binary]
